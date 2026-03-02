@@ -1,0 +1,57 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies + PyInstaller
+        working-directory: backend
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build backend with PyInstaller
+        working-directory: backend
+        run: pyinstaller freya.spec
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          VITE_API_BASE: 'http://localhost:8000'
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Electron installer
+        working-directory: electron
+        run: |
+          npm ci
+          npm run dist
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: freya-windows-installer
+          path: electron/dist/Freya Setup*.exe
+          if-no-files-found: error

@@ -1,0 +1,33 @@
+# Python
+backend/.venv/
+backend/__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+backend/dist/
+backend/build/
+backend/*.spec.bak
+
+# User data (PDFs, audio, extracted text) — never commit
+backend/data/uploads/
+backend/data/hash_index.json
+# Ignore all UUID doc dirs (anything that looks like a UUID)
+backend/data/????????-????-????-????-????????????/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# Electron
+electron/node_modules/
+electron/dist/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
