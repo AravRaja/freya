@@ -29,15 +29,21 @@ function getFrontendIndex() {
 
 function startBackend() {
   const exe = getBackendExe()
+  const logDir = app.getPath('userData')
+  const logPath = path.join(logDir, 'backend.log')
+  const fs = require('fs')
+  fs.mkdirSync(logDir, { recursive: true })
+  const logStream = fs.openSync(logPath, 'w')
+
   backendProcess = spawn(exe, [], {
     windowsHide: true,
-    stdio: 'ignore',
+    stdio: ['ignore', logStream, logStream],
   })
   backendProcess.on('error', (err) => {
-    console.error('Backend process error:', err)
+    fs.appendFileSync(logPath, `\n[electron] spawn error: ${err.message}\n`)
   })
   backendProcess.on('exit', (code) => {
-    console.log('Backend exited with code:', code)
+    fs.appendFileSync(logPath, `\n[electron] backend exited with code: ${code}\n`)
   })
 }
 
@@ -96,9 +102,10 @@ app.whenReady().then(async () => {
   try {
     await pollPort(BACKEND_PORT, POLL_TIMEOUT_MS)
   } catch (err) {
+    const logPath = path.join(app.getPath('userData'), 'backend.log')
     dialog.showErrorBox(
       'Freya — Backend failed to start',
-      `The backend server did not respond on port ${BACKEND_PORT}.\n\n${err.message}\n\nCheck that no other application is using port ${BACKEND_PORT}.`
+      `The backend server did not respond on port ${BACKEND_PORT}.\n\n${err.message}\n\nCheck the log for details:\n${logPath}`
     )
     app.quit()
     return
