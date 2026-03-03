@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { PdfViewer } from './PdfViewer'
-import { api } from './api'
+import { api, BASE } from './api'
 import aiProfileImg from '../ai_profile.png'
 
 type PageItem = { page: number; text: string }
@@ -201,14 +201,14 @@ export default function App() {
 
   const totalPages = pages.length > 0 ? pages.length : pdfNumPages
   const readyAudioPages = progress.readyAudioPages
-  const pdfUrl = docId ? `/api/pdf/${docId}` : null
+  const pdfUrl = docId ? `${BASE}/pdf/${docId}` : null
   const audioUrl =
     audioEnabled &&
     docId &&
     currentPage >= 1 &&
     totalPages >= 1 &&
     currentPage <= totalPages
-      ? `/api/audio/${docId}/${currentPage}`
+      ? `${BASE}/audio/${docId}/${currentPage}`
       : null
 
   const goToPage = useCallback((page: number) => {
@@ -339,7 +339,7 @@ export default function App() {
   useEffect(() => {
     if (!audioEnabled || !docId || totalPages < 1 || pages.length === 0) return
     const controller = new AbortController()
-    const base = `/api/audio/${docId}`
+    const base = `${BASE}/audio/${docId}`
     const center = playing ? currentPage : viewPage
     for (let i = -PREFETCH_BEHIND; i <= PREFETCH_AHEAD; i++) {
       const page = center + i
@@ -501,7 +501,7 @@ export default function App() {
                       onClick={() => openBook(b.docId)}
                     >
                       <img
-                        src={`/api/thumbnail/${b.docId}`}
+                        src={`${BASE}/thumbnail/${b.docId}`}
                         alt=""
                         onError={(e) => {
                           e.currentTarget.style.display = 'none'
