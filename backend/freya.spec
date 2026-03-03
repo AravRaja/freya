@@ -38,9 +38,12 @@ a = Analysis(
         'uvicorn.protocols.websockets.auto',
         'uvicorn.lifespan.on',
         'uvicorn.lifespan.off',
-        # Windows TTS driver
+        # Windows TTS driver + COM initialisation
         'pyttsx3.drivers',
         'pyttsx3.drivers.sapi5',
+        'pythoncom',
+        'win32com',
+        'win32com.client',
         # async runtime
         'anyio',
         'anyio._backends._asyncio',

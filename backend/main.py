@@ -281,17 +281,24 @@ def _run_tts_for_page(
         except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             pass
     try:
-        import pyttsx3
-        engine = pyttsx3.init()
-        if voice:
-            for v in engine.getProperty("voices"):
-                if voice in (v.id, getattr(v, "name", "")):
-                    engine.setProperty("voice", v.id)
-                    break
-        if rate is not None:
-            engine.setProperty("rate", rate)
-        engine.save_to_file(text or " ", str(out_path))
-        engine.runAndWait()
+        if sys.platform == "win32":
+            import pythoncom
+            pythoncom.CoInitialize()
+        try:
+            import pyttsx3
+            engine = pyttsx3.init()
+            if voice:
+                for v in engine.getProperty("voices"):
+                    if voice in (v.id, getattr(v, "name", "")):
+                        engine.setProperty("voice", v.id)
+                        break
+            if rate is not None:
+                engine.setProperty("rate", rate)
+            engine.save_to_file(text or " ", str(out_path))
+            engine.runAndWait()
+        finally:
+            if sys.platform == "win32":
+                pythoncom.CoUninitialize()
     except Exception:
         if sys.platform == "darwin":
             _tts_macos_say(text, out_path, voice=voice, rate=rate)
