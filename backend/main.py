@@ -23,6 +23,13 @@ import fitz  # pymupdf
 import httpx
 import pytesseract
 from fastapi import Body, FastAPI, HTTPException, UploadFile
+
+# On Windows, point pytesseract at the default UB-Mannheim install location
+# if tesseract isn't already on PATH.
+if sys.platform == "win32" and not shutil.which("tesseract"):
+    _default = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+    if _default.exists():
+        pytesseract.pytesseract.tesseract_cmd = str(_default)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
