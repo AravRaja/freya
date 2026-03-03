@@ -746,3 +746,8 @@ async def delete_book(doc_id: str):
     if doc_id in job_status:
         del job_status[doc_id]
     return {"deleted": doc_id}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
