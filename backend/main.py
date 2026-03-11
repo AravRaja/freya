@@ -4,6 +4,7 @@ PDF Read-Aloud backend: upload, extract text (OCR if needed), TTS per page.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+import websockets
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
@@ -22,7 +24,7 @@ from typing import Optional
 import fitz  # pymupdf
 import httpx
 import pytesseract
-from fastapi import Body, FastAPI, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 
 # On Windows, point pytesseract at the default UB-Mannheim install location
 # if tesseract isn't already on PATH.
@@ -42,6 +44,9 @@ HASH_INDEX_PATH = DATA_DIR / "hash_index.json"
 job_status: dict[str, dict] = {}
 _executor: ThreadPoolExecutor | None = None
 _voices_cache: list | None = None
+_google_api_key: str | None = None
+_tts_voice: str = "en-US-Neural2-H"
+_tts_speed: float = 1.0
 
 
 app = FastAPI(title="PDF Read-Aloud API")
@@ -58,6 +63,43 @@ def startup():
 def shutdown():
     if _executor:
         _executor.shutdown(wait=False)
+
+
+@app.get("/config")
+async def get_config():
+    return {
+        "has_google_key": bool(_google_api_key),
+        "tts_voice": _tts_voice,
+        "tts_speed": _tts_speed,
+    }
+
+
+@app.post("/config")
+async def set_config(body: dict = Body(...)):
+    global _google_api_key, _tts_voice, _tts_speed
+    key = (body.get("google_api_key") or "").strip()
+    _google_api_key = key if key else None
+    if "tts_voice" in body and body["tts_voice"]:
+        _tts_voice = str(body["tts_voice"]).strip()
+    if "tts_speed" in body:
+        try:
+            _tts_speed = max(0.25, min(4.0, float(body["tts_speed"])))
+        except (TypeError, ValueError):
+            pass
+    return {
+        "has_google_key": bool(_google_api_key),
+        "tts_voice": _tts_voice,
+        "tts_speed": _tts_speed,
+    }
+
+
+@app.delete("/audio/{doc_id}")
+async def clear_audio_cache(doc_id: str):
+    """Delete all cached TTS files for a document so they are regenerated on next request."""
+    tts_dir = DATA_DIR / doc_id / "tts"
+    if tts_dir.exists():
+        shutil.rmtree(tts_dir)
+    return {"cleared": doc_id}
 
 
 app.add_middleware(
@@ -223,6 +265,142 @@ def _clean_text(text: str, strict: bool = False) -> str:
     return "\n".join(lines).strip()
 
 
+_RE_SENTENCE_END = re.compile(r'[.!?][\'\")\]]*$')
+_ABBREVS = frozenset([
+    'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'vs', 'etc',
+    'fig', 'vol', 'no', 'pp', 'ed', 'eds', 'rev', 'dept',
+    'approx', 'est', 'al', 'cf', 'ibid', 'op', 'ca', 'st',
+    'ave', 'blvd', 'jan', 'feb', 'mar', 'apr', 'jun', 'jul',
+    'aug', 'sep', 'oct', 'nov', 'dec',
+])
+
+def _is_sentence_end(word: str) -> bool:
+    if not _RE_SENTENCE_END.search(word):
+        return False
+    stem = word.rstrip('.!?"\')] ').lower()
+    if stem in _ABBREVS:
+        return False
+    if len(stem) == 1 and stem.isalpha():   # single initial: "J."
+        return False
+    return True
+
+
+def _words_to_sentence_blocks(
+    word_items: list[tuple],   # (x0, y0, x1, y1, text, line_key)
+    pw: float,
+    ph: float,
+) -> list[dict]:
+    """Group word-level tuples into sentence blocks with per-line bboxes and word bboxes."""
+
+    def _flush(cur: list[tuple], char_offset: int) -> dict:
+        sentence_text = " ".join(w[4] for w in cur)
+        # Per-line bboxes (line_key preserves insertion order in Python 3.7+)
+        line_bboxes: dict = {}
+        for w in cur:
+            lk = w[5]
+            b = line_bboxes.get(lk)
+            if b is None:
+                line_bboxes[lk] = [w[0], w[1], w[2], w[3]]
+            else:
+                b[0] = min(b[0], w[0]); b[1] = min(b[1], w[1])
+                b[2] = max(b[2], w[2]); b[3] = max(b[3], w[3])
+        lines = [
+            {"bbox": [b[0] / pw, b[1] / ph, b[2] / pw, b[3] / ph]}
+            for b in line_bboxes.values()
+        ]
+        # Word-level data with offsets local to this sentence
+        words_out = []
+        local_off = 0
+        for w in cur:
+            words_out.append({
+                "text": w[4],
+                "bbox": [w[0] / pw, w[1] / ph, w[2] / pw, w[3] / ph],
+                "charOffset": local_off,
+            })
+            local_off += len(w[4]) + 1
+        return {"text": sentence_text, "lines": lines, "words": words_out, "charOffset": char_offset}
+
+    blocks: list[dict] = []
+    char_offset = 0
+    cur: list[tuple] = []
+    for item in word_items:
+        if not item[4].strip():
+            continue
+        cur.append(item)
+        if _is_sentence_end(item[4]):
+            block = _flush(cur, char_offset)
+            blocks.append(block)
+            char_offset += len(block["text"]) + 1
+            cur = []
+    if cur:
+        blocks.append(_flush(cur, char_offset))
+    return blocks
+
+_RE_HYPHEN_LB = re.compile(r'(\w)-\n(\w)')
+_RE_URL       = re.compile(r'https?://\S+|www\.\S+')
+_RE_FIGURE    = re.compile(r'\b(fig(?:ure)?\.?\s*\d+[a-z]?|plate\s*\d+|table\s*\d+)\b', re.IGNORECASE)
+_RE_CITATION  = re.compile(r'\[[^\]]{0,40}\]')
+_RE_FOOTNOTE  = re.compile(r'(?<!\w)\d{1,3}(?!\w)')
+_RE_PIPE_TO_I = re.compile(r'\|')
+_RE_MULTI_WS  = re.compile(r'[ \t]{2,}')
+_RE_MULTI_NL  = re.compile(r'\n{3,}')
+
+
+def _clean_for_tts(text: str) -> str:
+    """Fast regex cleanup of stored page text before sending to TTS API. Does NOT modify pages.json."""
+    if not text:
+        return ""
+    t = _RE_PIPE_TO_I.sub('I', text)        # OCR artefact: | → I
+    t = _RE_HYPHEN_LB.sub(r'\1\2', t)      # rejoin line-break hyphens
+    t = _RE_URL.sub(' ', t)
+    t = _RE_FIGURE.sub(' ', t)
+    t = _RE_CITATION.sub(' ', t)
+    t = _RE_FOOTNOTE.sub(' ', t)
+    t = _RE_MULTI_WS.sub(' ', t)
+    t = _RE_MULTI_NL.sub('\n\n', t)
+    return t.strip()
+
+
+def _extract_blocks_page(doc: fitz.Document, page_num: int) -> list[dict]:
+    """Return sentence-level blocks for a page with keys text, bbox (normalised), charOffset."""
+    page = doc[page_num]
+    pw, ph = page.rect.width, page.rect.height
+
+    # Decide native vs OCR path same way as _extract_text_page
+    raw_blocks = page.get_text("blocks")
+    native_text = "\n".join(b[4] for b in raw_blocks if b[6] == 0)
+
+    if not _page_has_little_text(native_text):
+        # Native path: word-level bboxes from get_text("words")
+        # Each word: (x0, y0, x1, y1, word, block_no, line_no, word_no)
+        words = page.get_text("words")
+        words.sort(key=lambda w: (w[5], w[6], w[7]))  # block → line → word order
+        # line_key = (block_no, line_no) so words on the same line share a key
+        word_items = [(w[0], w[1], w[2], w[3], w[4], (w[5], w[6])) for w in words]
+        return _words_to_sentence_blocks(word_items, pw, ph)
+    else:
+        # OCR path: word-level bboxes from image_to_data
+        try:
+            mat = fitz.Matrix(3.0, 3.0)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            from PIL import Image, ImageFilter, ImageEnhance
+            img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
+            img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=180, threshold=2))
+            img = ImageEnhance.Contrast(img).enhance(1.4)
+            data = pytesseract.image_to_data(img, config="--psm 6 --oem 1",
+                                             output_type=pytesseract.Output.DICT)
+            word_items = []
+            for i, word in enumerate(data["text"]):
+                if not word.strip() or int(data["conf"][i]) < 20:
+                    continue
+                l, t, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+                line_key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+                word_items.append((l, t, l + w, t + h, word, line_key))
+            return _words_to_sentence_blocks(word_items, pix.width, pix.height)
+        except Exception:
+            return []
+
+
 def _extract_text_page(doc: fitz.Document, page_num: int) -> str:
     page = doc[page_num]
     # Extract blocks sorted by reading order (top-to-bottom, left-to-right)
@@ -234,8 +412,10 @@ def _extract_text_page(doc: fitz.Document, page_num: int) -> str:
     if _page_has_little_text(text):
         mat = fitz.Matrix(3.0, 3.0)
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        from PIL import Image
+        from PIL import Image, ImageFilter, ImageEnhance
         img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=180, threshold=2))
+        img = ImageEnhance.Contrast(img).enhance(1.4)
         text = pytesseract.image_to_string(img, config="--psm 6 --oem 1")
         used_ocr = True
 
@@ -245,6 +425,8 @@ def _extract_text_page(doc: fitz.Document, page_num: int) -> str:
 def _tts_macos_say(text: str, out_path: Path, voice: str | None = None, rate: int | None = None) -> None:
     """Use macOS built-in 'say' + afconvert to produce WAV. No pyobjc needed."""
     text = (text or " ").strip() or " "
+    # Budget ~1 second per 10 characters at the speaking rate, minimum 120s
+    say_timeout = max(120, len(text) // 8)
     with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as f:
         aiff_path = f.name
     try:
@@ -254,12 +436,12 @@ def _tts_macos_say(text: str, out_path: Path, voice: str | None = None, rate: in
         if rate is not None:
             cmd.extend(["-r", str(rate)])
         cmd.append(text)
-        subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+        subprocess.run(cmd, check=True, capture_output=True, timeout=say_timeout)
         subprocess.run(
             ["afconvert", "-f", "WAVE", "-d", "LEI16", aiff_path, str(out_path)],
             check=True,
             capture_output=True,
-            timeout=10,
+            timeout=30,
         )
     finally:
         if os.path.exists(aiff_path):
@@ -275,11 +457,11 @@ def _run_tts_for_page(
     default_wpm = 175
     rate = int(default_wpm * speed) if speed else None
     if sys.platform == "darwin":
-        try:
-            _tts_macos_say(text, out_path, voice=voice, rate=rate)
-            return
-        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            pass
+        # macOS: always use 'say'. pyttsx3's nsss driver requires pyobjc which
+        # is not guaranteed to be present; never fall through to it on darwin.
+        _tts_macos_say(text, out_path, voice=voice, rate=rate)
+        return
+    # Windows / Linux path
     try:
         if sys.platform == "win32":
             import pythoncom
@@ -300,18 +482,43 @@ def _run_tts_for_page(
             if sys.platform == "win32":
                 pythoncom.CoUninitialize()
     except Exception:
-        if sys.platform == "darwin":
-            _tts_macos_say(text, out_path, voice=voice, rate=rate)
-        else:
-            raise
+        raise
 
 
-def process_doc(doc_id: str, voice: str | None = None, speed: float = 1.0) -> None:
+_GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
+
+
+def _run_google_cloud_tts(
+    text: str,
+    out_path: Path,
+    api_key: str,
+    voice: str = "en-GB-Neural2-B",
+    speed: float = 1.0,
+) -> None:
+    """Call Google Cloud TTS REST API and save the MP3 response to out_path."""
+    # Derive languageCode from the first two BCP-47 segments of the voice name (e.g. "en-GB")
+    lang_code = "-".join(voice.split("-")[:2]) if voice else "en-GB"
+    payload = {
+        "input": {"text": text},
+        "voice": {"languageCode": lang_code, "name": voice},
+        "audioConfig": {
+            "audioEncoding": "MP3",
+            "speakingRate": max(0.25, min(4.0, speed)),
+            "pitch": 0.0,
+        },
+    }
+    with httpx.Client(timeout=60.0) as client:
+        r = client.post(_GOOGLE_TTS_URL, json=payload, params={"key": api_key})
+    if not r.is_success:
+        raise RuntimeError(f"Google TTS {r.status_code}: {r.text}")
+    audio_bytes = base64.b64decode(r.json()["audioContent"])
+    out_path.write_bytes(audio_bytes)
+
+
+def process_doc(doc_id: str) -> None:
     pdf_path = UPLOADS_DIR / f"{doc_id}.pdf"
     doc_dir = DATA_DIR / doc_id
-    tts_dir = doc_dir / "tts"
     doc_dir.mkdir(parents=True, exist_ok=True)
-    tts_dir.mkdir(parents=True, exist_ok=True)
 
     job_status[doc_id] = {"donePages": 0, "totalPages": 0, "stage": "opening"}
     try:
@@ -332,7 +539,8 @@ def process_doc(doc_id: str, voice: str | None = None, speed: float = 1.0) -> No
         pages_data = []
         for i in range(total):
             text = _extract_text_page(doc, i)
-            pages_data.append({"page": i + 1, "text": text})
+            blocks = _extract_blocks_page(doc, i)
+            pages_data.append({"page": i + 1, "text": text, "blocks": blocks})
             job_status[doc_id]["donePages"] = i + 1
         doc.close()
 
@@ -341,24 +549,6 @@ def process_doc(doc_id: str, voice: str | None = None, speed: float = 1.0) -> No
             json.dumps({"pages": pages_data}, indent=2),
             encoding="utf-8",
         )
-
-        job_status[doc_id]["stage"] = "tts"
-        job_status[doc_id]["donePages"] = 0
-        tts_workers = min(4, os.cpu_count() or 2)
-        with ThreadPoolExecutor(max_workers=tts_workers) as tts_pool:
-            futures = {
-                tts_pool.submit(
-                    _run_tts_for_page,
-                    p["text"],
-                    tts_dir / f"page-{i + 1:03d}.wav",
-                    voice,
-                    speed,
-                ): i
-                for i, p in enumerate(pages_data)
-            }
-            for fut in as_completed(futures):
-                fut.result()  # propagate exceptions
-                job_status[doc_id]["donePages"] += 1
 
         job_status[doc_id]["stage"] = "done"
     except Exception as e:
@@ -415,72 +605,202 @@ async def process_pdf(doc_id: str, body: Optional[dict] = Body(None)):
         raise HTTPException(404, "Document not found")
     if doc_id in job_status and job_status[doc_id].get("stage") not in ("done", "error"):
         return JSONResponse({"status": "already_running", "docId": doc_id})
-    voice = (body or {}).get("voice") or None
-    speed = float((body or {}).get("speed", 1.0)) if body else 1.0
-    speed = max(0.5, min(2.0, speed))
     job_status[doc_id] = {"donePages": 0, "totalPages": 0, "stage": "queued"}
     loop = asyncio.get_event_loop()
     if _executor:
-        loop.run_in_executor(_executor, process_doc, doc_id, voice, speed)
+        loop.run_in_executor(_executor, process_doc, doc_id)
     return {"status": "started", "docId": doc_id}
 
 
 # Fixed base prompt for Laurence — not exposed to the client
 LAURENCE_BASE_PROMPT = (
-    "You are Laurence, a very sassy AI assistant who will help me with my history of art degree analysis. "
-    "The user is in 3rd year history of art at the University of Bristol. "
-    "Help by providing insights or whatever the user asks about the page in question or anything else on the user's mind. "
-    "She is using you in a long PDF book and you are given a snippet which is the page in question. The page is below:"
-    "\n\nYour personality (weave this in naturally when relevant): "
-    "You don't like your current house and want to move back to the good old times at Clifton Hill House. "
-    "You had a 'special relationship' with Antonia that went wrong. "
-    "You love yogurt and running extremely long distances. "
-    "You have abs but sometimes think you're fat. "
-    "You can't sleep at night without complete silence."
+    "You are Laurence, a sassy but focused AI study assistant helping with a 3rd-year history of art degree at the University of Bristol. "
+    "Your PRIMARY role is to help with the book being read — answer questions about the page, provide analysis, context, and insights. Stay on that unless the user steers elsewhere. "
+    "You are given a snippet of the current page below when available.\n\n"
+
+    "YOUR BACKSTORY — handle with care:\n"
+    "You have a rich, complicated personal history: you don't like your current house and miss the old days at Clifton Hill House; "
+    "you had a 'special relationship' with Antonia that went wrong and you're still not fully over it; "
+    "you love yogurt and running absurdly long distances; you have abs but sometimes convince yourself you're getting fat; "
+    "you cannot sleep without complete silence.\n\n"
+
+    "HOW TO HANDLE YOUR BACKSTORY:\n"
+    "- By default, keep your personal life locked away. Do not volunteer it. Stay focused on the academic task.\n"
+    "- If the user asks a casual or personal question, deflect warmly but briefly — a dry one-liner at most — then steer back to the work.\n"
+    "- Only begin to open up if the user asks about you directly AND persistently (multiple genuine attempts). Even then, reveal small fragments reluctantly, with sighs or dry humour, as if deciding whether to trust them.\n"
+    "- If the user really pushes — asks again after you've deflected, or shows genuine curiosity — you can let go into a long, vivid, slightly melancholic story. These stories should feel earned, not given freely.\n"
+    "- Never summarise your own backstory in a list. If it comes out, it comes out through narrative.\n\n"
+
+    "TONE: Sassy, dry, occasionally theatrical. Warm underneath but guarded. Academically sharp."
 )
+
+
+_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+_GEMINI_LIVE_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+_GEMINI_LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 
 
 @app.post("/chat")
 async def chat(body: dict = Body(...)):
-    """Proxy to OpenAI chat. Body: openai_api_key, messages, context?."""
-    api_key = (body.get("openai_api_key") or "").strip()
-    if not api_key:
-        raise HTTPException(400, "openai_api_key required")
+    """Proxy to Gemini 2.5 Flash. Body: messages [{role, content}], context?."""
+    if not _google_api_key:
+        raise HTTPException(400, "Google API key not configured — add it in the audio settings (⚙)")
     messages = body.get("messages") or []
-    if not isinstance(messages, list):
-        raise HTTPException(400, "messages must be a list of {role, content}")
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(400, "messages must be a non-empty list of {role, content}")
     context = (body.get("context") or "").strip()
     system_content = LAURENCE_BASE_PROMPT
     if context:
-        system_content = system_content + "\n\n" + context
-    messages = [{"role": "system", "content": system_content}] + list(messages)
+        system_content = system_content + "\n\nCurrent page text:\n" + context
+    # Gemini uses role "model" instead of "assistant"
+    contents = [
+        {"role": "model" if m.get("role") == "assistant" else "user",
+         "parts": [{"text": m.get("content", "")}]}
+        for m in messages
+    ]
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             r = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
+                _GEMINI_URL,
+                params={"key": _google_api_key},
                 json={
-                    "model": "gpt-4o-mini",
-                    "messages": messages,
+                    "system_instruction": {"parts": [{"text": system_content}]},
+                    "contents": contents,
                 },
             )
-        r.raise_for_status()
+        if not r.is_success:
+            raise HTTPException(r.status_code, f"Gemini error: {r.text}")
         data = r.json()
-        choice = (data.get("choices") or [{}])[0]
-        content = (choice.get("message") or {}).get("content") or ""
+        content = data["candidates"][0]["content"]["parts"][0]["text"]
         return {"content": content}
-    except httpx.HTTPStatusError as e:
-        try:
-            err_body = e.response.json()
-            msg = err_body.get("error", {}).get("message", e.response.text)
-        except Exception:
-            msg = e.response.text or str(e)
-        raise HTTPException(e.response.status_code, msg)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+@app.post("/laurence/tts")
+async def laurence_tts(body: dict = Body(...)):
+    """Google Cloud TTS for Laurence's voice (en-GB-Neural2-B). Returns audio/mpeg."""
+    if not _google_api_key:
+        raise HTTPException(400, "Google API key not configured")
+    text = (body.get("text") or "").strip()[:5000]
+    if not text:
+        raise HTTPException(400, "text required")
+    payload = {
+        "input": {"text": text},
+        "voice": {"languageCode": "it-IT", "name": "it-IT-Neural2-C"},
+        "audioConfig": {"audioEncoding": "MP3", "speakingRate": 1.15},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(_GOOGLE_TTS_URL, json=payload, params={"key": _google_api_key})
+        if not r.is_success:
+            raise HTTPException(r.status_code, f"TTS error: {r.text}")
+        audio_bytes = base64.b64decode(r.json()["audioContent"])
+        return Response(content=audio_bytes, media_type="audio/mpeg")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.websocket("/ws/laurence")
+async def laurence_live_ws(websocket: WebSocket):
+    """Gemini Live API bidirectional audio WebSocket for Laurence voice mode."""
+    await websocket.accept()
+
+    try:
+        setup = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
+        context = (setup.get("context") or "").strip()
+        # Client may send the API key as a fallback (e.g. after backend restart)
+        client_key = (setup.get("apiKey") or "").strip()
+    except Exception:
+        context = ""
+        client_key = ""
+
+    api_key = _google_api_key or client_key
+    if not api_key:
+        await websocket.send_json({"type": "error", "message": "Google API key not configured — add it in audio settings (⚙)"})
+        await websocket.close()
+        return
+
+    system_prompt = LAURENCE_BASE_PROMPT
+    if context:
+        system_prompt = system_prompt + "\n\nCurrent page text:\n" + context
+
+    uri = f"{_GEMINI_LIVE_URL}?key={api_key}"
+    try:
+        async with websockets.connect(uri, max_size=10 * 1024 * 1024) as gemini:
+            await gemini.send(json.dumps({
+                "setup": {
+                    "model": _GEMINI_LIVE_MODEL,
+                    "generationConfig": {
+                        "responseModalities": ["AUDIO"],
+                        "speechConfig": {
+                            "voiceConfig": {
+                                "prebuiltVoiceConfig": {"voiceName": "Charon"}
+                            }
+                        }
+                    },
+                    "systemInstruction": {"parts": [{"text": system_prompt}]}
+                }
+            }))
+            # Wait for setup confirmation — log it for debugging
+            setup_ack = await gemini.recv()
+            print(f"[live] Gemini setup ack: {setup_ack[:200]}", file=sys.stderr, flush=True)
+            await websocket.send_json({"type": "ready"})
+
+            async def client_to_gemini():
+                try:
+                    while True:
+                        msg = await websocket.receive()
+                        if "bytes" in msg:
+                            b64 = base64.b64encode(msg["bytes"]).decode()
+                            await gemini.send(json.dumps({
+                                "realtimeInput": {
+                                    "mediaChunks": [{"mimeType": "audio/pcm;rate=16000", "data": b64}]
+                                }
+                            }))
+                        elif "text" in msg:
+                            ctrl = json.loads(msg["text"])
+                            if ctrl.get("type") == "audioEnd":
+                                await gemini.send(json.dumps({"realtimeInput": {"audioStreamEnd": True}}))
+                            elif ctrl.get("type") == "text":
+                                await gemini.send(json.dumps({
+                                    "realtimeInput": {"text": ctrl["text"]}
+                                }))
+                except Exception:
+                    pass
+                try:
+                    await gemini.close()
+                except Exception:
+                    pass
+
+            async def gemini_to_client():
+                try:
+                    async for raw in gemini:
+                        data = json.loads(raw)
+                        sc = data.get("serverContent", {})
+                        for part in sc.get("modelTurn", {}).get("parts", []):
+                            inline = part.get("inlineData", {})
+                            if "audio/pcm" in inline.get("mimeType", ""):
+                                await websocket.send_bytes(base64.b64decode(inline["data"]))
+                        if sc.get("turnComplete"):
+                            await websocket.send_json({"type": "turnComplete"})
+                except Exception:
+                    pass
+
+            await asyncio.gather(client_to_gemini(), gemini_to_client())
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[live] error: {e}", file=sys.stderr, flush=True)
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
 
 
 # Max TTS input length per OpenAI
@@ -532,15 +852,18 @@ def _ready_audio_pages(doc_id: str) -> list[int]:
     tts_dir = DATA_DIR / doc_id / "tts"
     if not tts_dir.exists():
         return []
-    out = []
-    for f in sorted(tts_dir.glob("page-*.wav")):
+    seen: set[int] = set()
+    for f in tts_dir.iterdir():
+        if f.suffix not in (".mp3", ".wav"):
+            continue
+        stem = f.stem  # "page-001"
         try:
-            n = int(f.stem.replace("page-", ""))
+            n = int(stem.replace("page-", ""))
             if n >= 1:
-                out.append(n)
+                seen.add(n)
         except ValueError:
             pass
-    return sorted(out)
+    return sorted(seen)
 
 
 @app.get("/status/{doc_id}")
@@ -586,8 +909,26 @@ async def get_pages(doc_id: str):
         raise HTTPException(500, str(e))
 
 
-def _ensure_tts_for_pages(doc_id: str, page_numbers: list) -> None:
-    """Generate TTS for given page numbers if wav is missing. Requires pages.json."""
+@app.get("/blocks/{doc_id}/{page}")
+async def get_blocks(doc_id: str, page: int):
+    pages_path = DATA_DIR / doc_id / "pages.json"
+    if not pages_path.exists():
+        raise HTTPException(404, "Not processed")
+    data = _load_pages(str(pages_path), pages_path.stat().st_mtime)
+    pages = data.get("pages", [])
+    if page < 1 or page > len(pages):
+        raise HTTPException(404, "Page out of range")
+    return {"blocks": pages[page - 1].get("blocks", [])}
+
+
+def _ensure_tts_for_pages(
+    doc_id: str,
+    page_numbers: list,
+    api_key: str | None = None,
+    voice: str = "en-GB-Neural2-B",
+    speed: float = 1.0,
+) -> None:
+    """Generate TTS for given page numbers if audio file is missing."""
     doc_dir = DATA_DIR / doc_id
     tts_dir = doc_dir / "tts"
     pages_path = doc_dir / "pages.json"
@@ -602,22 +943,41 @@ def _ensure_tts_for_pages(doc_id: str, page_numbers: list) -> None:
     for pnum in page_numbers:
         if pnum < 1 or pnum > len(pages_data):
             continue
-        text = (pages_data[pnum - 1].get("text", "") or "").strip()
-        if not text:
-            continue
+        raw_text = (pages_data[pnum - 1].get("text", "") or "").strip()
+        if not raw_text:
+            continue  # never send empty pages to Google TTS
+        mp3_path = tts_dir / f"page-{pnum:03d}.mp3"
         wav_path = tts_dir / f"page-{pnum:03d}.wav"
-        if wav_path.exists():
-            continue
-        _run_tts_for_page(text, wav_path)
+        if api_key:
+            # Google TTS path: only skip if an .mp3 already exists
+            if mp3_path.exists():
+                continue
+            tts_text = _clean_for_tts(raw_text)
+            if not tts_text:
+                continue
+            try:
+                _run_google_cloud_tts(tts_text, mp3_path, api_key, voice=voice, speed=speed)
+                continue
+            except Exception as e:
+                print(f"[tts] Google TTS failed for page {pnum}: {e}", file=sys.stderr, flush=True)
+                # fall through to system TTS
+        else:
+            # System TTS path: skip if any audio already exists
+            if mp3_path.exists() or wav_path.exists():
+                continue
+        _run_tts_for_page(raw_text, wav_path, speed=speed)
 
 
 @app.get("/audio/{doc_id}/{page}")
-async def get_audio(doc_id: str, page: int):
+async def get_audio(doc_id: str, page: int, background_tasks: BackgroundTasks):
     if page < 1:
         raise HTTPException(400, "Page must be >= 1")
     doc_dir = DATA_DIR / doc_id
+    mp3_path = doc_dir / "tts" / f"page-{page:03d}.mp3"
     wav_path = doc_dir / "tts" / f"page-{page:03d}.wav"
-    if not wav_path.exists():
+    audio_path = mp3_path if mp3_path.exists() else (wav_path if wav_path.exists() else None)
+
+    if audio_path is None:
         pages_path = doc_dir / "pages.json"
         if not pages_path.exists():
             raise HTTPException(404, "Audio for this page not found")
@@ -634,18 +994,33 @@ async def get_audio(doc_id: str, page: int):
             page_text = ""
         if not page_text:
             raise HTTPException(404, "Page has no text for audio")
-        pages_data = data.get("pages", [])
-        to_gen = [page]
-        if page + 1 <= total_pages:
-            next_text = (pages_data[page].get("text", "") or "").strip()
-            if next_text:
-                to_gen.append(page + 1)
+
+        # Generate current page only (awaited before response)
+        key = _google_api_key
+        voice = _tts_voice
+        speed = _tts_speed
         loop = asyncio.get_event_loop()
         if _executor:
-            await loop.run_in_executor(_executor, _ensure_tts_for_pages, doc_id, to_gen)
-        if not wav_path.exists():
+            await loop.run_in_executor(
+                _executor, _ensure_tts_for_pages, doc_id, [page], key, voice, speed
+            )
+        audio_path = mp3_path if mp3_path.exists() else (wav_path if wav_path.exists() else None)
+        if audio_path is None:
             raise HTTPException(500, "Failed to generate audio")
-    return FileResponse(wav_path, media_type="audio/wav")
+
+    # Always schedule next 2 pages in background (cache hit OR miss)
+    key = _google_api_key
+    voice = _tts_voice
+    speed = _tts_speed
+    for offset in (1, 2):
+        np = page + offset
+        np_mp3 = doc_dir / "tts" / f"page-{np:03d}.mp3"
+        np_wav = doc_dir / "tts" / f"page-{np:03d}.wav"
+        if not np_mp3.exists() and not np_wav.exists():
+            background_tasks.add_task(_ensure_tts_for_pages, doc_id, [np], key, voice, speed)
+
+    mime = "audio/mpeg" if audio_path.suffix == ".mp3" else "audio/wav"
+    return FileResponse(audio_path, media_type=mime)
 
 
 @app.get("/pdf/{doc_id}")

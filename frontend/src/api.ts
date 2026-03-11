@@ -1,5 +1,14 @@
 export const BASE = (import.meta.env.VITE_API_BASE as string) || '/api'
 
+export const WS_BASE = (() => {
+  const apiBase = (import.meta.env.VITE_API_BASE as string) || ''
+  if (apiBase) return apiBase.replace(/^http/, 'ws')
+  if (typeof window !== 'undefined') {
+    return `${window.location.protocol.replace('http', 'ws')}//${window.location.host}`
+  }
+  return 'ws://localhost:8000'
+})()
+
 function checkResponse(r: Response, body: string): never | void {
   if (!r.ok) throw new Error(body || r.statusText)
 }
@@ -71,15 +80,21 @@ export const api = {
     return text ? JSON.parse(text) : {}
   },
 
-  async pages(docId: string): Promise<{ pages: { page: number; text: string }[] }> {
+  async pages(docId: string): Promise<{ pages: { page: number; text: string; blocks?: { text: string; charOffset: number; lines: { bbox: [number,number,number,number] }[]; words: { text: string; bbox: [number,number,number,number]; charOffset: number }[]; bbox?: [number,number,number,number] }[] }[] }> {
     const r = await apiFetch(`${BASE}/pages/${docId}`)
     const text = await r.text()
     checkResponse(r, text)
     return text ? JSON.parse(text) : {}
   },
 
+  async blocks(docId: string, page: number): Promise<{ blocks: { text: string; lines: { bbox: [number,number,number,number] }[]; words: { text: string; bbox: [number,number,number,number]; charOffset: number }[]; charOffset: number }[] }> {
+    const r = await apiFetch(`${BASE}/blocks/${docId}/${page}`)
+    const text = await r.text()
+    checkResponse(r, text)
+    return text ? JSON.parse(text) : { blocks: [] }
+  },
+
   async chat(params: {
-    openai_api_key: string
     messages: { role: string; content: string }[]
     context?: string
   }): Promise<{ content: string }> {
@@ -91,6 +106,19 @@ export const api = {
     const text = await r.text()
     checkResponse(r, text)
     return text ? JSON.parse(text) : { content: '' }
+  },
+
+  async laurenceTts(text: string): Promise<Blob> {
+    const r = await apiFetch(`${BASE}/laurence/tts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    })
+    if (!r.ok) {
+      const t = await r.text()
+      checkResponse(r, t)
+    }
+    return r.blob()
   },
 
   async tts(params: {
@@ -112,5 +140,26 @@ export const api = {
       checkResponse(r, text)
     }
     return r.blob()
+  },
+
+  async setConfig(params: {
+    google_api_key?: string
+    tts_voice?: string
+    tts_speed?: number
+  }): Promise<{ has_google_key: boolean; tts_voice: string; tts_speed: number }> {
+    const r = await apiFetch(`${BASE}/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    })
+    const text = await r.text()
+    checkResponse(r, text)
+    return text ? JSON.parse(text) : { has_google_key: false, tts_voice: 'en-GB-Neural2-B', tts_speed: 1.0 }
+  },
+
+  async clearAudio(docId: string): Promise<void> {
+    const r = await apiFetch(`${BASE}/audio/${docId}`, { method: 'DELETE' })
+    const text = await r.text()
+    checkResponse(r, text)
   },
 }

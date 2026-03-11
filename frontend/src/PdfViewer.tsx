@@ -7,17 +7,34 @@ if (typeof window !== 'undefined') {
 
 const PAGE_LOAD_DELAY_MS = 80
 
+type WordItem  = { text: string; bbox: [number,number,number,number]; charOffset: number }
+type LineItem  = { bbox: [number,number,number,number] }
+type BlockItem = {
+  text: string
+  charOffset: number
+  lines: LineItem[]
+  words: WordItem[]
+  /** legacy fallback for old pages.json without lines/words */
+  bbox?: [number,number,number,number]
+}
+
 type Props = {
   url: string | null
   page: number
+  allBlocks?: Record<number, BlockItem[]>
+  activeBlock?: number
+  activeWordBbox?: [number,number,number,number] | null
+  searchResult?: { page: number; blockIdx: number }
   onPageClick?: (pageNum: number) => void
   onCurrentPageChange?: (pageNum: number) => void
   onNumPages?: (numPages: number) => void
+  onBlockClick?: (pageNum: number, blockIdx: number) => void
+  zoom?: number
 }
 
-const DEFAULT_SCALE = 1.5
+const DEFAULT_SCALE = 2.0
 
-export function PdfViewer({ url, page, onPageClick, onCurrentPageChange, onNumPages }: Props) {
+export function PdfViewer({ url, page, allBlocks, activeBlock, activeWordBbox, searchResult, onPageClick, onCurrentPageChange, onNumPages, onBlockClick, zoom }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const pageRefsRef = useRef<(HTMLDivElement | null)[]>([])
   const [loading, setLoading] = useState(false)
@@ -143,7 +160,7 @@ export function PdfViewer({ url, page, onPageClick, onCurrentPageChange, onNumPa
     )
   }
   return (
-    <div className="pdf-pages-container" ref={containerRef}>
+    <div className="pdf-pages-container" ref={containerRef} style={{ zoom: zoom ?? 1 }}>
       {Array.from({ length: numPages }, (_, i) => (
         <PdfPage
           key={i}
@@ -154,6 +171,11 @@ export function PdfViewer({ url, page, onPageClick, onCurrentPageChange, onNumPa
           priority={priorityPage === i + 1}
           onRequestPriority={onRequestPriority}
           onPageClick={onPageClick}
+          blocks={allBlocks?.[i + 1]}
+          activeBlock={i + 1 === page ? activeBlock : undefined}
+          activeWordBbox={i + 1 === page ? activeWordBbox : undefined}
+          searchBlock={searchResult?.page === i + 1 ? searchResult.blockIdx : undefined}
+          onBlockClick={onBlockClick ? (idx) => onBlockClick(i + 1, idx) : undefined}
         />
       ))}
     </div>
@@ -167,16 +189,22 @@ type PageProps = {
   priority: boolean
   onRequestPriority: (pageNum: number) => void
   onPageClick?: (pageNum: number) => void
+  blocks?: BlockItem[]
+  activeBlock?: number
+  activeWordBbox?: [number,number,number,number] | null
+  searchBlock?: number
+  onBlockClick?: (idx: number) => void
 }
 
 const PdfPage = React.forwardRef<HTMLDivElement, PageProps>(function PdfPage(
-  { docRef, pageNum, scale, priority, onRequestPriority, onPageClick },
+  { docRef, pageNum, scale, priority, onRequestPriority, onPageClick, blocks, activeBlock, activeWordBbox, searchBlock, onBlockClick },
   ref
 ) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const renderTaskRef = useRef<{ cancel: () => void } | null>(null)
   const delayRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [rendered, setRendered] = useState(false)
+  const [hoveredBlock, setHoveredBlock] = useState<number | null>(null)
 
   useEffect(() => {
     const doc = docRef.current
@@ -264,6 +292,66 @@ const PdfPage = React.forwardRef<HTMLDivElement, PageProps>(function PdfPage(
         </button>
       )}
       <canvas ref={canvasRef} />
+      {blocks && blocks.length > 0 && (
+        <div className="pdf-block-overlay">
+          {blocks.map((b, idx) => {
+            const isActive  = idx === activeBlock
+            const isSearch  = idx === searchBlock
+            const isHovered = idx === hoveredBlock
+            const rects: [number,number,number,number][] =
+              b.lines?.length
+                ? b.lines.map(l => l.bbox)
+                : b.bbox ? [b.bbox] : []
+            const total = rects.length
+            const R = '8px'
+            const leftMost  = Math.min(...rects.map(r => r[0]))
+            const rightMost = Math.max(...rects.map(r => r[2]))
+            const effL = (i: number) => i === 0         ? rects[i][0] : leftMost
+            const effR = (i: number) => i === total - 1 ? rects[i][2] : rightMost
+            return rects.map((r, ri) => {
+              const first = ri === 0
+              const last  = ri === total - 1
+              const left  = effL(ri)
+              const right = effR(ri)
+              const tlRound = first || effL(ri) !== effL(ri - 1)
+              const trRound = first || effR(ri) !== effR(ri - 1)
+              const brRound = last  || effR(ri) !== effR(ri + 1)
+              const blRound = last  || effL(ri) !== effL(ri + 1)
+              const borderRadius = `${tlRound?R:'0'} ${trRound?R:'0'} ${brRound?R:'0'} ${blRound?R:'0'}`
+              return (
+                <div
+                  key={`${idx}-${ri}`}
+                  className={`pdf-block-highlight${isActive ? ' active' : ''}${isSearch ? ' search' : ''}${isHovered ? ' hovered' : ''}`}
+                  style={{
+                    left:   `calc(${left * 100}% - 6px)`,
+                    top:    `${r[1] * 100}%`,
+                    width:  `calc(${(right - left) * 100}% + 12px)`,
+                    height: last
+                      ? `calc(${(r[3] - r[1]) * 100}% + 4px)`
+                      : `${(rects[ri + 1][1] - r[1]) * 100}%`,
+                    borderRadius,
+                  }}
+                  onMouseEnter={() => setHoveredBlock(idx)}
+                  onMouseLeave={() => setHoveredBlock(null)}
+                  onClick={(e) => { e.stopPropagation(); onBlockClick?.(idx) }}
+                  title={first ? b.text.slice(0, 80) : undefined}
+                />
+              )
+            })
+          })}
+          {activeWordBbox && (
+            <div
+              className="pdf-word-highlight"
+              style={{
+                left:   `calc(${activeWordBbox[0] * 100}% - 6px)`,
+                top:    `calc(${activeWordBbox[1] * 100}% - 3px)`,
+                width:  `calc(${(activeWordBbox[2] - activeWordBbox[0]) * 100}% + 12px)`,
+                height: `calc(${(activeWordBbox[3] - activeWordBbox[1]) * 100}% + 6px)`,
+              }}
+            />
+          )}
+        </div>
+      )}
     </div>
   )
 })
