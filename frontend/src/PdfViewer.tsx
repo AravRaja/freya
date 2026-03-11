@@ -295,13 +295,16 @@ const PdfPage = React.forwardRef<HTMLDivElement, PageProps>(function PdfPage(
       {blocks && blocks.length > 0 && (
         <div className="pdf-block-overlay">
           {blocks.map((b, idx) => {
-            const isActive  = idx === activeBlock
-            const isSearch  = idx === searchBlock
-            const isHovered = idx === hoveredBlock
+            // Skip blocks with no text or no geometry
+            if (!b.text?.trim()) return null
             const rects: [number,number,number,number][] =
               b.lines?.length
                 ? b.lines.map(l => l.bbox)
                 : b.bbox ? [b.bbox] : []
+            if (rects.length === 0) return null
+            const isActive  = idx === activeBlock
+            const isSearch  = idx === searchBlock
+            const isHovered = idx === hoveredBlock
             const total = rects.length
             const R = '8px'
             const leftMost  = Math.min(...rects.map(r => r[0]))

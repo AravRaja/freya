@@ -32,7 +32,7 @@ export default function App() {
   const [pages, setPages] = useState<PageItem[]>([])
   const [currentPage, setCurrentPage] = useState(1)
   const [playing, setPlaying] = useState(false)
-  const [books, setBooks] = useState<{ docId: string; title: string; processed: boolean }[]>([])
+  const [books, setBooks] = useState<{ docId: string; title: string; processed: boolean; createdAt?: string }[]>([])
   const [autoplay] = useState(true)
   const [audioEnabled] = useState(true)
   const [viewPage, setViewPage] = useState(1)
@@ -89,6 +89,15 @@ export default function App() {
     return isNaN(stored) ? 1 : Math.max(0, Math.min(1, stored))
   })
   const chatListRef = useRef<HTMLDivElement>(null)
+
+  // ── Library UI state ───────────────────────────────
+  const [librarySortBy, setLibrarySortBy] = useState<'date' | 'alpha'>('date')
+  const [librarySortDir, setLibrarySortDir] = useState<'desc' | 'asc'>('desc')
+  const [libraryViewMode, setLibraryViewMode] = useState<'grid' | 'list'>('grid')
+  const [librarySearch, setLibrarySearch] = useState('')
+  const [selectedBooks, setSelectedBooks] = useState<Set<string>>(new Set())
+  const [contextMenu, setContextMenu] = useState<{ docId: string; x: number; y: number } | null>(null)
+  const [sortDropdownOpen, setSortDropdownOpen] = useState(false)
 
   const [pdfZoom, setPdfZoom] = useState(0.7)
   const [searchInput, setSearchInput] = useState('')
@@ -689,11 +698,6 @@ export default function App() {
     refreshLibrary()
   }, [books, refreshLibrary])
 
-  const titleShort = useCallback((s: string, words = 4) => {
-    const w = (s || '').trim().split(/\s+/)
-    if (w.length <= words) return s || ''
-    return w.slice(0, words).join(' ') + (w.length > words ? '…' : '')
-  }, [])
 
   const saveRename = useCallback(
     async (docId: string) => {
@@ -741,38 +745,173 @@ export default function App() {
     goToPage(searchResults[next].page)
   }, [searchResults, searchIdx, goToPage])
 
+  // ── Library display helpers ─────────────────────────
+  const displayedBooks = useMemo(() => {
+    let result = [...books]
+    if (librarySearch.trim()) {
+      const q = librarySearch.toLowerCase()
+      result = result.filter((b) => b.title.toLowerCase().includes(q))
+    }
+    result.sort((a, b) => {
+      if (librarySortBy === 'alpha') {
+        const cmp = a.title.localeCompare(b.title)
+        return librarySortDir === 'asc' ? cmp : -cmp
+      } else {
+        const da = a.createdAt ?? ''
+        const db = b.createdAt ?? ''
+        const cmp = da.localeCompare(db)
+        return librarySortDir === 'desc' ? -cmp : cmp
+      }
+    })
+    return result
+  }, [books, librarySearch, librarySortBy, librarySortDir])
+
+  const deleteSelected = useCallback(async () => {
+    if (selectedBooks.size === 0) return
+    if (!confirm(`Remove ${selectedBooks.size} book(s) from your library?`)) return
+    for (const id of selectedBooks) {
+      try { await api.deleteBook(id) } catch (e) { console.error(e) }
+    }
+    setSelectedBooks(new Set())
+    refreshLibrary()
+  }, [selectedBooks, refreshLibrary])
+
+  const toggleSelect = useCallback((id: string, e: React.MouseEvent) => {
+    e.stopPropagation()
+    setSelectedBooks((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
+  }, [])
+
   // ── Library view ───────────────────────────────────
   if (view === 'library') {
     return (
-      <div className="app" data-theme={colorScheme}>
-        <header className="header">
-          <div className="header-main-row">
-            <h1 className="app-wordmark">ReadAloud</h1>
-            <div className="header-actions">
-              {books.some((b) => !b.processed) && (
-                <button
-                  type="button"
-                  className="btn btn-accent"
-                  disabled={batchProgress !== null}
-                  onClick={processBatch}
-                >
-                  {batchProgress
-                    ? `Processing ${batchProgress.index}/${batchProgress.total}…`
-                    : 'Process all'}
+      <div className="app" data-theme={colorScheme} onClick={() => { setContextMenu(null); setSortDropdownOpen(false) }}>
+        {/* Context menu */}
+        {contextMenu && (
+          <div
+            className="lib-context-menu"
+            style={{ top: contextMenu.y, left: contextMenu.x }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button className="lib-context-item" onClick={() => { openBook(contextMenu.docId); setContextMenu(null) }}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2"/><polyline points="3 9 21 9"/></svg>
+              Open
+            </button>
+            <button className="lib-context-item" onClick={() => {
+              const b = books.find((x) => x.docId === contextMenu.docId)
+              if (b) { setEditingTitleId(b.docId); setEditingTitleValue(b.title) }
+              setContextMenu(null)
+            }}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+              Rename
+            </button>
+            <div className="lib-context-separator" />
+            <button className="lib-context-item lib-context-item--danger" onClick={(e) => { deleteBook(contextMenu.docId, e); setContextMenu(null) }}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+              Delete
+            </button>
+          </div>
+        )}
+
+        <header className="header lib-header">
+          <div className="lib-header-top">
+            {/* Logo */}
+            <div className="lib-logo">
+              <svg width="28" height="28" viewBox="0 0 32 32" fill="none">
+                <circle cx="16" cy="16" r="14" fill="var(--accent)" opacity="0.15"/>
+                <circle cx="16" cy="16" r="14" stroke="var(--accent)" strokeWidth="1.5"/>
+                <polygon points="13,10 23,16 13,22" fill="var(--accent)"/>
+              </svg>
+              <span className="lib-logo-name">Laurenzo</span>
+            </div>
+
+            {/* Right actions */}
+            <div className="lib-header-right">
+              {selectedBooks.size > 0 && (
+                <button type="button" className="lib-btn lib-btn--danger" onClick={deleteSelected}>
+                  Delete {selectedBooks.size} selected
                 </button>
               )}
-              <label className="btn btn-upload">
-                + Add PDF
-                <input
-                  type="file"
-                  accept=".pdf"
-                  onChange={(e) => {
-                    const f = e.target.files?.[0]
-                    if (f) onUpload(f)
-                  }}
-                />
+              {books.some((b) => !b.processed) && (
+                <button type="button" className="lib-btn lib-btn--ghost" disabled={batchProgress !== null} onClick={processBatch}>
+                  {batchProgress ? `Processing ${batchProgress.index}/${batchProgress.total}…` : 'Process all'}
+                </button>
+              )}
+              <label className="lib-btn lib-btn--upload">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                Upload PDF
+                <input type="file" accept=".pdf" onChange={(e) => { const f = e.target.files?.[0]; if (f) onUpload(f) }} />
               </label>
+            </div>
+          </div>
 
+          {/* Toolbar row */}
+          <div className="lib-toolbar">
+            <h2 className="lib-title">Library</h2>
+            <div className="lib-toolbar-right">
+              {/* Search */}
+              <div className="lib-search">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                <input
+                  type="text"
+                  placeholder="Search PDFs…"
+                  value={librarySearch}
+                  onChange={(e) => setLibrarySearch(e.target.value)}
+                  className="lib-search-input"
+                />
+                {librarySearch && (
+                  <button className="lib-search-clear" onClick={() => setLibrarySearch('')}>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                  </button>
+                )}
+              </div>
+
+              {/* Sort dropdown */}
+              <div className="lib-sort-wrap" onClick={(e) => e.stopPropagation()}>
+                <button className="lib-sort-btn" onClick={() => setSortDropdownOpen((v) => !v)}>
+                  {librarySortBy === 'date' ? (
+                    <><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points={librarySortDir === 'desc' ? '19 12 12 19 5 12' : '5 12 12 5 19 12'}/></svg> Date Added</>
+                  ) : (
+                    <><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points={librarySortDir === 'asc' ? '19 12 12 19 5 12' : '5 12 12 5 19 12'}/></svg> A–Z</>
+                  )}
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+                </button>
+                {sortDropdownOpen && (
+                  <div className="lib-sort-dropdown">
+                    <button className={`lib-sort-option ${librarySortBy === 'date' ? 'active' : ''}`} onClick={() => {
+                      if (librarySortBy === 'date') setLibrarySortDir((d) => d === 'desc' ? 'asc' : 'desc')
+                      else { setLibrarySortBy('date'); setLibrarySortDir('desc') }
+                      setSortDropdownOpen(false)
+                    }}>
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+                      Date Added
+                      {librarySortBy === 'date' && <span className="lib-sort-hint">{librarySortDir === 'desc' ? 'Newest first' : 'Oldest first'}</span>}
+                    </button>
+                    <button className={`lib-sort-option ${librarySortBy === 'alpha' ? 'active' : ''}`} onClick={() => {
+                      if (librarySortBy === 'alpha') setLibrarySortDir((d) => d === 'asc' ? 'desc' : 'asc')
+                      else { setLibrarySortBy('alpha'); setLibrarySortDir('asc') }
+                      setSortDropdownOpen(false)
+                    }}>
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 7l3-3 3 3"/><path d="M6 4v16"/><path d="M13 7h8"/><path d="M13 12h6"/><path d="M13 17h4"/></svg>
+                      Alphabetical
+                      {librarySortBy === 'alpha' && <span className="lib-sort-hint">{librarySortDir === 'asc' ? 'A to Z' : 'Z to A'}</span>}
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* View mode toggle */}
+              <div className="lib-view-toggle">
+                <button className={`lib-view-btn ${libraryViewMode === 'grid' ? 'active' : ''}`} onClick={() => setLibraryViewMode('grid')} title="Grid view">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+                </button>
+                <button className={`lib-view-btn ${libraryViewMode === 'list' ? 'active' : ''}`} onClick={() => setLibraryViewMode('list')} title="List view">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+                </button>
+              </div>
             </div>
           </div>
         </header>
@@ -784,7 +923,7 @@ export default function App() {
               Processing {batchProgress.index}/{batchProgress.total} — <em>{batchProgress.current}</em>
             </div>
           )}
-          {books.length === 0 ? (
+          {displayedBooks.length === 0 ? (
             <div className="library-empty-state">
               <div className="library-empty-icon">
                 <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
@@ -792,37 +931,56 @@ export default function App() {
                   <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
                 </svg>
               </div>
-              <p className="library-empty-title">Your library is empty</p>
-              <p className="library-empty-sub">Upload a PDF to get started</p>
+              <p className="library-empty-title">{librarySearch ? 'No results found' : 'Your library is empty'}</p>
+              <p className="library-empty-sub">{librarySearch ? `No PDFs matching "${librarySearch}"` : 'Upload a PDF to get started'}</p>
             </div>
-          ) : (
+          ) : libraryViewMode === 'grid' ? (
             <ul className="library-grid">
-              {books.map((b) => (
-                <li key={b.docId} className="library-card-wrap">
+              {displayedBooks.map((b) => (
+                <li key={b.docId} className={`library-card-wrap ${selectedBooks.has(b.docId) ? 'selected' : ''}`}>
                   <div className="library-card">
+                    {/* Checkbox */}
+                    <button
+                      className={`lib-card-checkbox ${selectedBooks.has(b.docId) ? 'checked' : ''}`}
+                      onClick={(e) => toggleSelect(b.docId, e)}
+                      aria-label="Select"
+                    >
+                      {selectedBooks.has(b.docId) && (
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.5" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+                      )}
+                    </button>
+
+                    {/* 3-dot menu */}
+                    <button
+                      className="lib-card-menu-btn"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        const rect = e.currentTarget.getBoundingClientRect()
+                        setContextMenu({ docId: b.docId, x: rect.right + 8, y: rect.top })
+                      }}
+                      aria-label="More options"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+                    </button>
+
                     <button
                       type="button"
                       className="library-card-poster"
-                      onClick={() => openBook(b.docId)}
+                      onClick={() => { if (selectedBooks.size > 0) toggleSelect(b.docId, { stopPropagation: () => {} } as React.MouseEvent); else openBook(b.docId) }}
                     >
                       <img
                         src={`${BASE}/thumbnail/${b.docId}`}
                         alt=""
-                        onError={(e) => {
-                          e.currentTarget.style.display = 'none'
-                        }}
+                        onError={(e) => { e.currentTarget.style.display = 'none' }}
                       />
                       <div className="library-card-overlay">
                         <div className="library-card-play-btn">
-                          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-                            <polygon points="5,3 19,12 5,21"/>
-                          </svg>
+                          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
                         </div>
-                        {!b.processed && (
-                          <span className="library-card-badge">Unprocessed</span>
-                        )}
+                        {!b.processed && <span className="library-card-badge">Unprocessed</span>}
                       </div>
                     </button>
+
                     <div className="library-card-info">
                       {editingTitleId === b.docId ? (
                         <input
@@ -833,39 +991,70 @@ export default function App() {
                           onBlur={() => saveRename(b.docId)}
                           onKeyDown={(e) => {
                             if (e.key === 'Enter') saveRename(b.docId)
-                            if (e.key === 'Escape') {
-                              setEditingTitleId(null)
-                              setEditingTitleValue('')
-                            }
+                            if (e.key === 'Escape') { setEditingTitleId(null); setEditingTitleValue('') }
                           }}
                           onClick={(e) => e.stopPropagation()}
                           autoFocus
                           aria-label="Rename title"
                         />
                       ) : (
-                        <span
-                          className="library-card-title"
-                          onDoubleClick={(e) => {
-                            e.preventDefault()
-                            e.stopPropagation()
-                            setEditingTitleId(b.docId)
-                            setEditingTitleValue(b.title)
-                          }}
-                          title={`${b.title} — Double-click to rename`}
-                        >
-                          {titleShort(b.title)}
+                        <span className="library-card-title" title={b.title}>
+                          {b.title}
                         </span>
                       )}
-                      <button
-                        type="button"
-                        className="library-card-delete"
-                        onClick={(e) => { e.stopPropagation(); deleteBook(b.docId, e) }}
-                        aria-label="Delete"
-                        title="Delete"
-                      >
-                        ×
-                      </button>
                     </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            /* List view */
+            <ul className="lib-list">
+              {displayedBooks.map((b) => (
+                <li key={b.docId} className={`lib-list-row ${selectedBooks.has(b.docId) ? 'selected' : ''}`}>
+                  <button
+                    className={`lib-card-checkbox ${selectedBooks.has(b.docId) ? 'checked' : ''}`}
+                    onClick={(e) => toggleSelect(b.docId, e)}
+                    aria-label="Select"
+                  >
+                    {selectedBooks.has(b.docId) && (
+                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.5" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+                    )}
+                  </button>
+                  <div className="lib-list-thumb" onClick={() => openBook(b.docId)}>
+                    <img src={`${BASE}/thumbnail/${b.docId}`} alt="" onError={(e) => { e.currentTarget.style.display = 'none' }} />
+                    {!b.processed && <span className="lib-list-badge">Unprocessed</span>}
+                  </div>
+                  <div className="lib-list-info" onClick={() => openBook(b.docId)}>
+                    {editingTitleId === b.docId ? (
+                      <input
+                        type="text"
+                        className="library-card-title-input"
+                        value={editingTitleValue}
+                        onChange={(e) => setEditingTitleValue(e.target.value)}
+                        onBlur={() => saveRename(b.docId)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') saveRename(b.docId)
+                          if (e.key === 'Escape') { setEditingTitleId(null); setEditingTitleValue('') }
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                        autoFocus
+                      />
+                    ) : (
+                      <span className="lib-list-title">{b.title}</span>
+                    )}
+                    <span className="lib-list-meta">pdf{b.createdAt ? ` · ${new Date(b.createdAt).toLocaleDateString()}` : ''}</span>
+                  </div>
+                  <div className="lib-list-actions">
+                    <button className="lib-list-action-btn" onClick={() => openBook(b.docId)} title="Open">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><polygon points="5 3 19 12 5 21"/></svg>
+                    </button>
+                    <button className="lib-list-action-btn" onClick={() => { setEditingTitleId(b.docId); setEditingTitleValue(b.title) }} title="Rename">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                    </button>
+                    <button className="lib-list-action-btn lib-list-action-btn--danger" onClick={(e) => deleteBook(b.docId, e)} title="Delete">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+                    </button>
                   </div>
                 </li>
               ))}
@@ -888,7 +1077,7 @@ export default function App() {
               </svg>
               Library
             </button>
-            <h1 className="app-wordmark app-wordmark-sm">ReadAloud</h1>
+            <h1 className="app-wordmark app-wordmark-sm">Laurenzo</h1>
           </div>
 
           {/* Center: playback */}

@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 import websockets
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -47,6 +48,11 @@ _voices_cache: list | None = None
 _google_api_key: str | None = None
 _tts_voice: str = "en-US-Neural2-H"
 _tts_speed: float = 1.0
+
+# Limit concurrent TTS generation to 1 to prevent CPU/fan overload
+_tts_semaphore = threading.Semaphore(1)
+# Cache Gemini-cleaned text keyed by text hash to avoid duplicate API calls
+_gemini_clean_cache: dict[str, str] = {}
 
 
 app = FastAPI(title="PDF Read-Aloud API")
@@ -175,9 +181,11 @@ async def upload_pdf(file: UploadFile):
         index[file_hash] = doc_id
         _save_hash_index(index)
         (DATA_DIR / doc_id).mkdir(parents=True, exist_ok=True)
+        import datetime as _dt
         (DATA_DIR / doc_id / "metadata.json").write_text(
             json.dumps(
-                {"filename": file.filename or "document.pdf", "fileHash": file_hash},
+                {"filename": file.filename or "document.pdf", "fileHash": file_hash,
+                 "createdAt": _dt.datetime.utcnow().isoformat() + "Z"},
                 indent=2,
             ),
             encoding="utf-8",
@@ -333,8 +341,10 @@ def _words_to_sentence_blocks(
             char_offset += len(block["text"]) + 1
             cur = []
     if cur:
-        blocks.append(_flush(cur, char_offset))
-    return blocks
+        b = _flush(cur, char_offset)
+        if b["text"].strip():
+            blocks.append(b)
+    return [b for b in blocks if b["text"].strip()]
 
 _RE_HYPHEN_LB = re.compile(r'(\w)-\n(\w)')
 _RE_URL       = re.compile(r'https?://\S+|www\.\S+')
@@ -347,18 +357,145 @@ _RE_MULTI_NL  = re.compile(r'\n{3,}')
 
 
 def _clean_for_tts(text: str) -> str:
-    """Fast regex cleanup of stored page text before sending to TTS API. Does NOT modify pages.json."""
+    """Light regex cleanup of stored page text before TTS. Does NOT modify pages.json."""
     if not text:
         return ""
-    t = _RE_PIPE_TO_I.sub('I', text)        # OCR artefact: | → I
-    t = _RE_HYPHEN_LB.sub(r'\1\2', t)      # rejoin line-break hyphens
+    t = _RE_PIPE_TO_I.sub('I', text)
+    t = _RE_HYPHEN_LB.sub(r'\1\2', t)
     t = _RE_URL.sub(' ', t)
-    t = _RE_FIGURE.sub(' ', t)
-    t = _RE_CITATION.sub(' ', t)
-    t = _RE_FOOTNOTE.sub(' ', t)
     t = _RE_MULTI_WS.sub(' ', t)
     t = _RE_MULTI_NL.sub('\n\n', t)
     return t.strip()
+
+
+_GEMINI_TTS_CLEAN_MODEL = "gemini-2.5-flash-lite"
+
+# Block-level Gemini prompt. Each block in the PDF viewer maps 1-to-1 with a numbered
+# entry here. Gemini returns cleaned text per block, or EMPTY to suppress the block
+# entirely (removes it from the highlight overlay AND from the TTS audio).
+_GEMINI_BLOCKS_PROMPT = """\
+You are a text pre-processor for a text-to-speech system reading academic art-history books \
+aloud. You receive numbered paragraph blocks from a PDF page. Return the same numbered list \
+with either the cleaned spoken text or EMPTY.
+
+━━━ ABSOLUTE CONTENT RULES (violating these is a critical failure) ━━━
+1. OUTPUT ONLY WHAT IS ALREADY IN THE INPUT. Never add, invent, or infer any words, \
+   details, context, or explanation that are not literally present in the input block.
+2. NEVER reorder, restructure, or rephrase sentences. Word order must be preserved exactly \
+   except for the specific substitutions listed below.
+3. NEVER merge two blocks into one line or split one block into multiple lines.
+4. NEVER change the meaning of any sentence.
+5. If you are unsure whether to remove something, KEEP IT.
+
+━━━ MARK AS EMPTY — be aggressive here ━━━
+Mark EMPTY for any block that is predominantly or entirely:
+• Nonsense / garbage characters: anything with random symbols, alternating case noise, \
+  special Unicode glyphs with no readable meaning — e.g. "HhUhUh", "@e® oe eg", "™6hUC", \
+  "° 2 & S a @ 9", "¢« #* @¢@", "& >.", single isolated letters or symbols per word
+• Pure bibliographic entry: "Smith, J. (1995). Title. New York: Publisher."
+• URL, DOI, ISBN, ISSN, or archive accession code alone: "10.1093/...", "ISBN 978-..."
+• Running header / footer: lone page number, repeated book title or author name at page edge
+• Standalone figure / table label only: "Fig. 3", "Plate 12", "Table 2.1"
+• Publisher imprint: "© 2014 Getty... All rights reserved... Printed in..."
+• Only punctuation, brackets, or reference markers: "[3]", "(ibid.)", "(see p. 12)"
+When in doubt about garbage — mark EMPTY. Real prose is obvious.
+
+━━━ WORD-LEVEL SUBSTITUTIONS (only these changes allowed within kept blocks) ━━━
+Slash "/" between words → "and": "oil/canvas" → "oil and canvas", "he/she" → "he or she"
+Inline bare footnote number after punctuation → delete only the number: "text.12 More" → "text. More"
+Parenthetical containing only a citation/accession code → delete the parenthetical:
+  "the work (acc. no. 2005.M.46) was donated" → "the work was donated"
+Abbreviations (replace in-place, nothing else around them changes):
+  no.→number  nos.→numbers  fig.→figure  figs.→figures  vol.→volume  pp.→pages  p.→page
+  pt.→part  ed.→editor  eds.→editors  ca.→circa  approx.→approximately
+  ibid.→in the same work  op. cit.→in the cited work  cf.→compare
+  i.e.→that is  e.g.→for example  et al.→and others  vs.→versus
+  repr.→reprinted  trans.→translated by  illus.→illustrated by
+Symbols: %→percent  &→and (unless in a proper name)  +→plus  ×→by  °→degrees  §→section
+Ordinals: 1st→first  2nd→second  3rd→third  4th→fourth  5th→fifth  (and so on)
+Hyphenated line-break: "photo-\\ngraph" → "photograph"
+OCR pipe: "|" → "I" only when clearly a capital letter
+
+━━━ HEADINGS ━━━
+If a block is a standalone heading / chapter title / section label (not prose):
+  append " ..." (replace any existing terminal punctuation with " ...")
+  e.g. "Foreword" → "Foreword ..."   "Introduction." → "Introduction ..."
+Normal prose sentences ending with a period: do NOT append " ..."
+
+━━━ OUTPUT FORMAT ━━━
+Exactly one output line per input block, same order:
+[1] cleaned text
+[2] EMPTY
+[3] cleaned text
+
+No blank lines. No preamble. No explanation. No markdown. Only the numbered list.\
+"""
+
+
+def _parse_gemini_blocks(raw: str, original_texts: list[str]) -> list[str]:
+    """Parse Gemini's numbered block response. Missing indices keep the original text."""
+    count = len(original_texts)
+    result = list(original_texts)  # fallback: keep originals for any block Gemini misses
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r'^\[(\d+)\]\s*(.*)', line)
+        if m:
+            idx = int(m.group(1)) - 1
+            text = m.group(2).strip()
+            if 0 <= idx < count:
+                result[idx] = "" if text.upper() == "EMPTY" else text
+    return result
+
+
+def _gemini_clean_blocks(blocks: list[dict], api_key: str) -> list[str]:
+    """Send page blocks to Gemini for per-block TTS cleaning.
+
+    Returns a list of cleaned strings parallel to `blocks`.
+    An empty string means the block should be hidden from the overlay and excluded from TTS.
+    Falls back to original block texts on any API error.
+    """
+    if not blocks or not api_key:
+        return [b.get("text", "") for b in blocks]
+
+    original_texts = [b.get("text", "") for b in blocks]
+    input_text = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(original_texts))
+    cache_key = hashlib.md5(input_text.encode()).hexdigest()
+    if cache_key in _gemini_clean_cache:
+        return json.loads(_gemini_clean_cache[cache_key])
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{_GEMINI_TTS_CLEAN_MODEL}:generateContent"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": f"{_GEMINI_BLOCKS_PROMPT}\n\n---\n\n{input_text}"}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8192},
+    }
+    try:
+        r = httpx.post(url, json=payload, params={"key": api_key}, timeout=45.0)
+        if r.is_success:
+            candidates = r.json().get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    raw = parts[0].get("text", "").strip()
+                    if raw:
+                        cleaned = _parse_gemini_blocks(raw, original_texts)
+                        empty_count = sum(1 for t in cleaned if not t)
+                        print(
+                            f"[gemini-blocks] OK {len(blocks)} blocks → {empty_count} removed",
+                            file=sys.stderr, flush=True,
+                        )
+                        _gemini_clean_cache[cache_key] = json.dumps(cleaned)
+                        return cleaned
+            print(f"[gemini-blocks] Empty response: {r.json()}", file=sys.stderr, flush=True)
+        else:
+            print(f"[gemini-blocks] API error {r.status_code}: {r.text[:300]}", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[gemini-blocks] Request failed: {e}", file=sys.stderr, flush=True)
+    return original_texts
 
 
 def _extract_blocks_page(doc: fitz.Document, page_num: int) -> list[dict]:
@@ -371,11 +508,9 @@ def _extract_blocks_page(doc: fitz.Document, page_num: int) -> list[dict]:
     native_text = "\n".join(b[4] for b in raw_blocks if b[6] == 0)
 
     if not _page_has_little_text(native_text):
-        # Native path: word-level bboxes from get_text("words")
-        # Each word: (x0, y0, x1, y1, word, block_no, line_no, word_no)
+        # Native path: word-level bboxes from get_text("words").
         words = page.get_text("words")
-        words.sort(key=lambda w: (w[5], w[6], w[7]))  # block → line → word order
-        # line_key = (block_no, line_no) so words on the same line share a key
+        words.sort(key=lambda w: (w[5], w[6], w[7]))
         word_items = [(w[0], w[1], w[2], w[3], w[4], (w[5], w[6])) for w in words]
         return _words_to_sentence_blocks(word_items, pw, ph)
     else:
@@ -396,6 +531,13 @@ def _extract_blocks_page(doc: fitz.Document, page_num: int) -> list[dict]:
                 l, t, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
                 line_key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
                 word_items.append((l, t, l + w, t + h, word, line_key))
+            # Apply the same page-level quality gate used by _extract_text_page:
+            # if the page is mostly garbage OCR, return no blocks at all.
+            all_words = [w[4] for w in word_items]
+            if all_words:
+                good = sum(1 for w in all_words if _is_good_ocr_word(w))
+                if good / len(all_words) < _OCR_QUALITY_THRESHOLD:
+                    return []
             return _words_to_sentence_blocks(word_items, pix.width, pix.height)
         except Exception:
             return []
@@ -539,7 +681,9 @@ def process_doc(doc_id: str) -> None:
         pages_data = []
         for i in range(total):
             text = _extract_text_page(doc, i)
-            blocks = _extract_blocks_page(doc, i)
+            # Only extract blocks when the page has real text — avoids storing
+            # garbage OCR blocks on decorative/image-only pages.
+            blocks = _extract_blocks_page(doc, i) if text.strip() else []
             pages_data.append({"page": i + 1, "text": text, "blocks": blocks})
             job_status[doc_id]["donePages"] = i + 1
         doc.close()
@@ -904,9 +1048,36 @@ async def get_pages(doc_id: str):
     if not pages_path.exists():
         raise HTTPException(404, "Pages not ready or document not found")
     try:
-        return _load_pages(str(pages_path), pages_path.stat().st_mtime)
+        data = _load_pages(str(pages_path), pages_path.stat().st_mtime)
     except Exception as e:
         raise HTTPException(500, str(e))
+
+    # Merge Gemini-cleaned blocks into each page when available.
+    # These files are written by _ensure_tts_for_pages and get_blocks.
+    tts_dir = DATA_DIR / doc_id / "tts"
+    if tts_dir.exists():
+        pages = data.get("pages", [])
+        merged = False
+        for p in pages:
+            cp = tts_dir / f"page-{p['page']:03d}-blocks.json"
+            if cp.exists():
+                cleaned = _load_cleaned_blocks(cp)
+                if cleaned is not None:
+                    p["blocks"] = cleaned
+                    merged = True
+        if merged:
+            return {"pages": pages}
+
+    return data
+
+
+def _load_cleaned_blocks(cleaned_path: Path) -> list[dict] | None:
+    """Load and filter a saved cleaned-blocks file. Returns None on missing/error."""
+    try:
+        cleaned = json.loads(cleaned_path.read_text(encoding="utf-8"))
+        return [b for b in cleaned.get("blocks", []) if b.get("text", "").strip()]
+    except Exception:
+        return None
 
 
 @app.get("/blocks/{doc_id}/{page}")
@@ -918,7 +1089,40 @@ async def get_blocks(doc_id: str, page: int):
     pages = data.get("pages", [])
     if page < 1 or page > len(pages):
         raise HTTPException(404, "Page out of range")
-    return {"blocks": pages[page - 1].get("blocks", [])}
+
+    tts_dir = DATA_DIR / doc_id / "tts"
+    cleaned_path = tts_dir / f"page-{page:03d}-blocks.json"
+
+    # Serve Gemini-cleaned blocks if already on disk.
+    if cleaned_path.exists():
+        result = _load_cleaned_blocks(cleaned_path)
+        if result is not None:
+            return {"blocks": result}
+
+    raw_blocks = pages[page - 1].get("blocks", [])
+
+    # If a Google API key is available, run Gemini now and cache the result so
+    # subsequent loads (and TTS generation) both benefit. Covers native-text pages
+    # whose garbage glyph artifacts weren't caught by the OCR quality gate.
+    if _google_api_key and raw_blocks:
+        loop = asyncio.get_event_loop()
+        cleaned_texts = await loop.run_in_executor(
+            _executor, _gemini_clean_blocks, raw_blocks, _google_api_key
+        )
+        char_off = 0
+        cleaned_blocks_out = []
+        for block, ct in zip(raw_blocks, cleaned_texts):
+            cb = {k: v for k, v in block.items() if k != "charOffset"}
+            cb["text"] = ct
+            cb["charOffset"] = char_off
+            if ct:
+                char_off += len(ct) + 1
+            cleaned_blocks_out.append(cb)
+        tts_dir.mkdir(parents=True, exist_ok=True)
+        cleaned_path.write_text(json.dumps({"blocks": cleaned_blocks_out}), encoding="utf-8")
+        return {"blocks": [b for b in cleaned_blocks_out if b.get("text", "").strip()]}
+
+    return {"blocks": raw_blocks}
 
 
 def _ensure_tts_for_pages(
@@ -940,32 +1144,55 @@ def _ensure_tts_for_pages(
     except Exception:
         return
     tts_dir.mkdir(parents=True, exist_ok=True)
-    for pnum in page_numbers:
-        if pnum < 1 or pnum > len(pages_data):
-            continue
-        raw_text = (pages_data[pnum - 1].get("text", "") or "").strip()
-        if not raw_text:
-            continue  # never send empty pages to Google TTS
-        mp3_path = tts_dir / f"page-{pnum:03d}.mp3"
-        wav_path = tts_dir / f"page-{pnum:03d}.wav"
-        if api_key:
-            # Google TTS path: only skip if an .mp3 already exists
-            if mp3_path.exists():
+    with _tts_semaphore:
+        for pnum in page_numbers:
+            if pnum < 1 or pnum > len(pages_data):
                 continue
-            tts_text = _clean_for_tts(raw_text)
-            if not tts_text:
-                continue
-            try:
-                _run_google_cloud_tts(tts_text, mp3_path, api_key, voice=voice, speed=speed)
-                continue
-            except Exception as e:
-                print(f"[tts] Google TTS failed for page {pnum}: {e}", file=sys.stderr, flush=True)
-                # fall through to system TTS
-        else:
-            # System TTS path: skip if any audio already exists
-            if mp3_path.exists() or wav_path.exists():
-                continue
-        _run_tts_for_page(raw_text, wav_path, speed=speed)
+            raw_text = (pages_data[pnum - 1].get("text", "") or "").strip()
+            if not raw_text:
+                continue  # never send empty pages to TTS
+            mp3_path = tts_dir / f"page-{pnum:03d}.mp3"
+            wav_path = tts_dir / f"page-{pnum:03d}.wav"
+            blocks_path = tts_dir / f"page-{pnum:03d}-blocks.json"
+            if api_key:
+                # Google TTS path
+                if mp3_path.exists():
+                    continue
+                raw_blocks = pages_data[pnum - 1].get("blocks", [])
+                if raw_blocks:
+                    # Clean each block individually — Gemini returns EMPTY for junk blocks.
+                    cleaned_texts = _gemini_clean_blocks(raw_blocks, api_key)
+                    # Build the cleaned blocks list (geometry unchanged, text replaced).
+                    char_off = 0
+                    cleaned_blocks_out = []
+                    for block, ct in zip(raw_blocks, cleaned_texts):
+                        cb = {k: v for k, v in block.items() if k != "charOffset"}
+                        cb["text"] = ct
+                        cb["charOffset"] = char_off
+                        if ct:
+                            char_off += len(ct) + 1
+                        cleaned_blocks_out.append(cb)
+                    # Save alongside the audio so /blocks can serve the cleaned version.
+                    blocks_path.write_text(
+                        json.dumps({"blocks": cleaned_blocks_out}), encoding="utf-8"
+                    )
+                    # TTS text = only the non-empty cleaned blocks, in order.
+                    tts_text = " ".join(ct for ct in cleaned_texts if ct).strip()
+                else:
+                    tts_text = _clean_for_tts(raw_text)
+                if not tts_text:
+                    continue
+                try:
+                    _run_google_cloud_tts(tts_text, mp3_path, api_key, voice=voice, speed=speed)
+                    continue
+                except Exception as e:
+                    print(f"[tts] Google TTS failed for page {pnum}: {e}", file=sys.stderr, flush=True)
+                    # fall through to system TTS
+            else:
+                # System TTS path: skip if any audio already exists
+                if mp3_path.exists() or wav_path.exists():
+                    continue
+            _run_tts_for_page(raw_text, wav_path, speed=speed)
 
 
 @app.get("/audio/{doc_id}/{page}")
@@ -976,6 +1203,23 @@ async def get_audio(doc_id: str, page: int, background_tasks: BackgroundTasks):
     mp3_path = doc_dir / "tts" / f"page-{page:03d}.mp3"
     wav_path = doc_dir / "tts" / f"page-{page:03d}.wav"
     audio_path = mp3_path if mp3_path.exists() else (wav_path if wav_path.exists() else None)
+
+    # Always validate that this page actually has text — guards against stale audio
+    # files left over from a previous processing run with different page numbering.
+    pages_path_check = doc_dir / "pages.json"
+    if pages_path_check.exists():
+        try:
+            data_check = _load_pages(str(pages_path_check), pages_path_check.stat().st_mtime)
+            pages_check = data_check.get("pages", [])
+            if page > len(pages_check):
+                raise HTTPException(404, "Page out of range")
+            page_text_check = (pages_check[page - 1].get("text", "") or "").strip()
+            if not page_text_check:
+                raise HTTPException(404, "Page has no text for audio")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
 
     if audio_path is None:
         pages_path = doc_dir / "pages.json"
@@ -1082,12 +1326,28 @@ async def list_library():
                 title = meta.get("filename", title)
             except Exception:
                 pass
+        created_at = ""
+        if meta_path.exists():
+            try:
+                m = json.loads(meta_path.read_text(encoding="utf-8"))
+                created_at = m.get("createdAt", "")
+            except Exception:
+                pass
+        if not created_at:
+            try:
+                import datetime as _dt
+                created_at = _dt.datetime.utcfromtimestamp(
+                    (DATA_DIR / doc_id).stat().st_mtime
+                ).isoformat() + "Z"
+            except Exception:
+                pass
         books.append({
             "docId": doc_id,
             "title": title,
             "processed": pages_path.exists(),
+            "createdAt": created_at,
         })
-    books.sort(key=lambda b: b["title"].lower())
+    books.sort(key=lambda b: b.get("createdAt", ""), reverse=True)
     return {"books": books}
 
 
