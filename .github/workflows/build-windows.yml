@@ -55,3 +55,13 @@ jobs:
           name: freya-windows-installer
           path: electron/dist/Freya Setup*.exe
           if-no-files-found: error
+
+      - name: Attach installer to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          EXE=$(ls electron/dist/Freya\ Setup*.exe | head -1)
+          gh release upload "$TAG" "$EXE" --clobber
